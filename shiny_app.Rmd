@@ -1,0 +1,1943 @@
+---
+title: "Shiny App gINTomics"
+output: html_document
+date: "2024-01-16"
+---
+
+```{r}
+library(gINTomics)
+library(MultiAssayExperiment)
+library(sessioninfo)
+library(dplyr)
+```
+
+```{r}
+# # devtools::install_github("angelovelle96/gINTomics@devel")  per installare la nuova versione
+
+ data("ov_test_tcga_omics")
+#
+ class <- rep(c('A', 'B'), each = 10)
+ names(class) <- colnames(mmultiassay_ov[[1]])
+ multiomics_integration <- run_multiomics(data = mmultiassay_ov, class = class)
+#
+# #------------------------------- extract model results --------------------------------
+#
+# # per ridge e hist e circos
+ data <- gINTomics:::extract_model_res(multiomics_integration)
+# #saveRDS(data, file = 'data4shiny')
+```
+
+```{r}
+setwd('/media/francesco/KINGSTON/romualdi/shiny_app')
+data <- readRDS('data4shiny')
+```
+
+```{r}
+# definisco e pulisco data per usarlo nella data table di shiny
+data_table <- data
+data_table <- filter(data_table, cov != '(Intercept)')   # elimino intercetta
+rownames(data_table) <- 1:nrow(data_table)
+data_table <- data_table[, !(names(data_table) %in% c('significativity', 'sign'))]
+
+# ricordare di ordinare le colonne per la visualizzazione della table
+#data_table$significativity_all <- ifelse(data_table$pval <= 0.05, 'significant', 'not significant')
+
+# sistemo e cambio nome colonne di data per i circos
+colnames(data)[colnames(data) == "response"] <- "gene"
+colnames(data)[colnames(data) == "start_response"] <- "start"
+colnames(data)[colnames(data) == "end_response"] <-"end"
+colnames(data)[colnames(data) == "chr_response"] <-"chr"
+data$direction_cov <- ifelse(data$cov_value < 0, 'negative', 'positive')
+data$direction_coef <- ifelse(data$coef < 0, 'negative', 'positive')
+data$cov_value <- abs(data$cov_value)
+data$coef <- abs(data$coef)
+
+# ora ho due df: data e data_table. data_table lo uso direttamente per la table, mentre data deve essere splittato nei 5 df per i circos
+```
+
+
+```{r splitting data into 5 dataframes}
+dataframes <- list()
+
+for (omic_val in unique(data$omics)) {
+  single_omic_df <- data[data$omics == omic_val, ]
+  
+  dataframes[[paste0('df_', omic_val)]] <- single_omic_df
+}
+```
+
+```{r splitting df_genomic_res into 2 dfs (cnv and met)}
+df_cnv <- filter(dataframes$df_gene_genomic_res, cnv_met == 'cnv')
+df_met <- filter(dataframes$df_gene_genomic_res, cnv_met == 'met')
+```
+
+```{r genomic ranges generation for every df (5)}
+library(GenomicRanges)
+
+cnv_gr <- makeGRangesFromDataFrame(df_cnv, seqnames.field = 'chr', start.field = 'start', end.field = 'end', keep.extra.columns = TRUE, na.rm = TRUE)
+met_gr <- makeGRangesFromDataFrame(df_met, seqnames.field = 'chr', start.field = 'start', end.field = 'end', keep.extra.columns = TRUE, na.rm = TRUE)
+mirna_cnv_gr <- makeGRangesFromDataFrame(dataframes$df_mirna_cnv_res, seqnames.field = 'chr', start.field = 'start', end.field = 'end', keep.extra.columns = TRUE, na.rm = TRUE)
+tf_gr <- makeGRangesFromDataFrame(dataframes$df_tf_res, seqnames.field = 'chr', start.field = 'start', end.field = 'end', keep.extra.columns = TRUE, na.rm = TRUE)
+tf_mirna_gr <- makeGRangesFromDataFrame(dataframes$df_tf_mirna_res, seqnames.field = 'chr', start.field = 'start', end.field = 'end', keep.extra.columns = TRUE, na.rm = TRUE)
+mirna_target_gr <- makeGRangesFromDataFrame(dataframes$df_mirna_target_res, seqnames.field = 'chr', start.field = 'start', end.field = 'end', keep.extra.columns = TRUE, na.rm = TRUE)
+```
+
+
+```{r Shiny}
+#devtools::install_github("Appsilon/shiny.gosling@dev")   # gosling devel version
+library(shiny)
+library(shiny.gosling)
+library(shiny.react)
+library(shinythemes)
+library(shinyjs)
+library(shinydashboard)
+library(DT)
+library(shinyWidgets)
+library(cyjShiny)
+library(htmlwidgets)
+library(graph)
+library(jsonlite)
+library(ggVennDiagram)
+library(plotly)
+library(heatmaply)
+library(ggridges)
+use_gosling()
+
+####################  cytoscape ####################################
+# HELPER FUNCTIONS ----
+# printf prints formatted output like in C
+printf <- function(...) cat(sprintf(...))
+
+# LOAD DATA ----
+# The yeast galactose network was the earliest demo used in the Cytoscape project,
+# consisting of the graph (a Bioconductor graphNEL) and expression (a data.frame)
+
+g <- get(load(system.file(package="cyjShiny", "extdata", "yeastGalactoseGraphNEL.RData")))
+printf("--- loaded g")
+print(g)
+tbl.mrna <- get(load(system.file(package="cyjShiny", "extdata", "yeastGalactoseExpressionTable.RData")))
+printf("--- loaded tbl.mrna: %d x %d", nrow(tbl.mrna), ncol(tbl.mrna))
+
+# GENERATE GRAPH ----
+tbl.mrna <- as.data.frame(tbl.mrna)
+nodeAttrs <- nodeData(g, attr="label")
+
+# Not used in all three experimental conditions
+g <- removeNode("YER056CA", g) 
+
+yeastGalactoseNodeNames <- as.character(nodeAttrs)
+yeastGalactodeNodeIDs <- nodes(g)
+
+g <- addNode("gal1RGexp", g)
+
+## Convert graphNEL data to cytoscape.js JSON structure (see https://js.cytoscape.org/#notation/elements-json)
+# NOTE: graphNEL is not a requirement of cyjShiny, but the cytoscape.js JSON structured string in variable "graph" is
+graph <- graphNELtoJSON(g)
+
+# Style files (see https://js.cytoscape.org/#style)
+yeastGalactoseStyleFile <- system.file(file.path("demos", "basicDemo", "yeastGalactoseStyle.js"), package="cyjShiny")
+basicStyleFile <- system.file(file.path("demos", "basicDemo", "basicStyle.js"), package="cyjShiny")
+
+# SET INPUT OPTIONS ----
+styleList <- c("", "Basic"="basicStyleFile", "Yeast-Galactose"="yeastGalactoseStyleFile")
+condition <- c("gal1RGexp", "gal4RGexp", "gal80Rexp")
+
+  ### --------------------------------------------------------------------- USER INTERFACE ---------------------------------------------------------------------------
+
+ui <- dashboardPage(
+  dashboardHeader(title = "gINTomics Visualizer 1.0"),
+  dashboardSidebar(
+    sidebarMenu(
+      menuItem("Home", tabName = "home", icon = icon("home")),
+      menuItem("Integration Results", tabName = "page1", icon = icon("info"),
+               menuSubItem("Genomic", tabName = "sub1"),
+               menuSubItem("mirna-cnv", tabName = "sub2"),
+               menuSubItem("TF", tabName = "sub3"),
+               menuSubItem("mirna-TF", tabName = "sub4"),
+               menuSubItem("mirna-Target", tabName = "sub4")
+      ),
+      menuItem("Page 2", tabName = "page2", icon = icon("info")),
+      menuItem("Compare Classes", tabName = "compare_class", icon = icon("info"))
+    )
+  ),
+  dashboardBody(
+    tabItems(
+      tabItem(tabName = "home",
+              fluidRow(
+                box(title = "Welcome", "This is the home page content.")
+              )
+      ),
+      tabItem(tabName = "page1",
+              fluidRow(
+                box(title = "Page 1", "This is the content of Page 1.")
+              )
+      ),
+      tabItem(tabName = "sub1",
+              fluidRow(
+                box(title = "Subsection 1", "This is the content of Subsection 1."),
+                mainPanel(
+                  tabsetPanel(type = 'tabs',
+                              tabPanel('Ridgeplot',  
+                                       sidebarLayout(
+                                         sidebarPanel(
+                                           selectInput("classRidge", "Select Class:", choices = unique(data$class)),
+                                           sliderInput("pval_range", "P-Value Range:", min = 0, max = 1, value = c(0, 0.05), step = 0.05)
+                                         ),
+                                           
+                                          mainPanel(
+                                            plotOutput("ridgelinePlot")
+                                          )
+                              )
+                              ),
+                              
+                              tabPanel('Histo', 
+                                       sidebarLayout(
+                                       sidebarPanel(
+                                                    selectInput("classHisto", "Select Class:", choices = unique(data_table$class)),
+                                                    sliderInput("pval_range_histo", "P-Value Range:", min = 0, max = 1, value = c(0, 0.05), step = 0.05)
+          
+        ),
+        mainPanel(
+          plotlyOutput('histogramPlot')
+        )
+      )
+                                       
+                                       ),
+                              tabPanel('Venn', 
+                                       sidebarLayout(
+                                       sidebarPanel(
+                                                    selectInput("classHisto", "Select Class:", choices = unique(data_table$class)),
+                                                    sliderInput("pval_range_histo", "P-Value Range:", min = 0, max = 1, value = c(0, 0.05), step = 0.05)
+          
+        ),
+        mainPanel(
+          plotlyOutput("venn_plot"),
+          dataTableOutput("common_genes_table")
+        )
+      )
+                                       ),
+                              tabPanel('heatmap',
+                                       sidebarLayout(
+                                       sidebarPanel(
+  numericInput("num_top_genes", "Numero di geni top:", value = 50),
+  selectInput("selected_genes", "Seleziona i geni:", choices = unique(data_table$cov), multiple = TRUE),
+  selectInput("selectClassHeatmap", "Select the class:", choices = unique(data_table$class), multiple = FALSE),
+  actionButton("show_selected_genes", "Mostra geni selezionati")
+          
+        ),
+        mainPanel(
+          plotlyOutput("heatmap")
+        )
+      )
+                                       ),
+                              tabPanel('volcano', 
+                                       sidebarLayout(
+                                       sidebarPanel(
+                                                    selectInput("classHisto", "Select Class:", choices = unique(data_table$class)),
+                                                    sliderInput("pval_range_histo", "P-Value Range:", min = 0, max = 1, value = c(0, 0.05), step = 0.05)
+          
+        ),
+        mainPanel(
+          plotlyOutput('volcanoPlot')
+        )
+      )
+                                       ),
+                              tabPanel('network',
+                                       tags$head(
+                                         tags$link(rel = "stylesheet", type = "text/css",
+                                                   href = "http://maxcdn.bootstrapcdn.com/font-awesome/4.2.0/css/font-awesome.min.css"),
+                                         tags$style("#cyjShiny{height:95vh !important;}")),
+                                       sidebarLayout(
+                                         sidebarPanel(
+                                           selectInput("loadStyleFile", "Select Style: ", choices=styleList),
+                                           selectInput("doLayout", "Select Layout:",
+                                                       choices=c("",
+                                                                 "cose",
+                                                                 "cola",
+                                                                 "circle",
+                                                                 "concentric",
+                                                                 "breadthfirst",
+                                                                 "grid",
+                                                                 "random",
+                                                                 "preset",
+                                                                 "fcose")),
+                                           
+                                           selectInput("setNodeAttributes", "Select Condition:", choices=condition),
+                                           selectInput("selectName", "Select Node by ID:", choices = c("", nodes(g))),
+                                           actionButton("sfn", "Select First Neighbor"),
+                                           actionButton("fit", "Fit Graph"),
+                                           actionButton("fitSelected", "Fit Selected"),
+                                           actionButton("clearSelection", "Unselect Nodes"),
+                                           HTML("<br>"),
+                                           actionButton("loopConditions", "Loop Conditions"),
+                                           HTML("<br>"),
+                                           actionButton("getSelectedNodes", "Get Selected Nodes"),
+                                           HTML("<br><br>"),
+                                           htmlOutput("selectedNodesDisplay"),
+                                           width=2
+                                         ),
+                                         mainPanel(
+                                           cyjShinyOutput('cyjShiny'),
+                                           width=10
+                                         )
+                                       )),
+                              tabPanel('table',
+                                       fluidRow(
+                                         column(6, DT::dataTableOutput('res_table'),
+                                                column(5,
+                                                       br(),
+                                                       selectInput(
+                                                         inputId = 'classSelectTable', 
+                                                         label = 'Class:', 
+                                                         choices = unique(data_table$class)),
+                                                       ),
+                                                column(4, br(), selectInput(inputId = 'integrationSelectTable', 
+                                                                            label = 'Integration Type:',
+                                                                            choices = unique(data_table$omics))),
+                                                
+                                                column(3, br(), selectInput(inputId = 'chrSelection', 
+                                                                            label = 'Chr:',
+                                                                            choices = unique(data_table$chr_cov)
+                                                )
+                                                ),
+                                                column(3, br(), sliderInput("pval_range", "P-Value Range:",
+                                                                            min = 0, max = 1, value = c(0, 0.05), step = 0.05),
+                                                ),
+                                                
+                                                use_gosling()
+                                         ))),
+                              tabPanel('enrichment'),
+                              tabPanel('circos',
+                                       sidebarLayout(
+        sidebarPanel(
+          selectInput("Class", "Select Class:", choices = unique(df_cnv$class))
+          #selectInput("species", "Select Species:", choices = c("setosa", "versicolor", "virginica"))
+        ),
+        mainPanel(
+          goslingOutput('gosling_plot_circos') ### uiOutput(goslingOutput('gosling_plot_circos'))  
+                                               ### uiOutput('gosling_plot_circos')
+        )
+      )
+                                       
+                                       )
+                  )
+                )
+              )
+      ),
+      tabItem(tabName = "sub2",
+              fluidRow(
+                box(title = "Subsection 2", "This is the content of Subsection 2.")
+              )
+      ),
+      tabItem(tabName = "page2",
+              fluidRow(
+                box(title = "Page 2", "This is the content of Page 2.")
+              )
+      ),
+      tabItem(tabName = "page3",
+              fluidRow(
+                box(title = "Page 3", "This is the content of Page 3.")
+              )
+      )
+    )
+  )
+)
+
+ #### ------------------------------------ SERVER -----------------------------------------------------------
+
+server <- function(input, output) {
+  
+# Creazione dei dati di esempio
+cnv_genes <- subset(data_table, cnv_met=='cnv', select = c('cov'))
+met_genes <- subset(data_table, cnv_met=='met', select = c('cov'))
+
+# Trova i geni comuni
+common_genes <- intersect(cnv_genes, met_genes)
+
+# Crea una lista contenente i due vettori di geni
+x <- list(CNV = cnv_genes, MET = met_genes)
+
+# Crea il diagramma di Venn
+p <- ggVennDiagram(x, show_intersect = TRUE)
+
+# Converti il diagramma in un'interfaccia plotly
+p_plotly <- ggplotly(p)
+
+# Aggiungi annotazioni per i geni comuni
+annotations <- lapply(common_genes, function(gene) {
+  list(x = gene, y = 0.5, text = gene, xref = "x", yref = "y", showarrow = FALSE)
+})
+
+p_plotly <- layout(p_plotly, annotations = annotations)
+
+# Visualizza il diagramma di Venn
+  output$venn_plot <- renderPlotly({
+    p_plotly
+  })
+  
+  # Visualizza la tabella dei geni comuni
+  output$common_genes_table <- renderDataTable({
+    data.frame(Genes = common_genes)
+  })
+
+
+
+
+# ottengo i valori di espressione (no integration)
+expr_A <- multiomics_integration$gene_genomic_res$A$data$response_var
+# traslo la matrice per avere i geni come righe
+expr_A <- t(expr_A)
+
+# ottengo solo il df dove ho integrazione cnv e solo met della classe A
+beta_cnv <- subset(data_table, cnv_met=='cnv', select = c('coef', 'pval', 'cov', 'class', 'cnv_met'))
+beta_met <- subset(data_table, cnv_met=='met', select = c('coef', 'pval', 'cov', 'class', 'cnv_met'))
+beta_cnv_A <- subset(beta_cnv, class=='A', select = c('coef', 'pval', 'cov', 'cnv_met'))
+beta_met_A <- subset(beta_met, class=='A', select = c('coef', 'pval', 'cov', 'cnv_met'))
+
+# rinomino le colonne per avere gli stessi nomi
+names(beta_cnv_A) <- c('coef', 'pval', 'cov', 'cnv_met')
+names(beta_met_A) <- c('coef', 'pval', 'cov', 'cnv_met')
+
+# unisco i df per le righe
+beta_merged_A <- rbind(beta_cnv_A, beta_met_A)
+
+top50_cnv_A <- head(beta_cnv_A[order(beta_cnv_A$pval), ], 25)
+top50_met_A <- head(beta_met_A[order(beta_met_A$pval), ], 25)
+
+# Selezionare i top 50 geni cnv e met unici
+top50_cnv_A <- unique(top50_cnv_A)
+top50_met_A <- unique(top50_met_A)
+
+# Combinare i top 50 geni cnv e met finali
+final_top_genes_A <- rbind(top50_cnv_A, top50_met_A)
+
+# Selezionare i primi 100 geni unici
+final_top_genes_A$coef_cnv <- ifelse(final_top_genes_A$cnv_met == 'cnv', final_top_genes_A$coef, NA)
+final_top_genes_A$coef_met <- ifelse(final_top_genes_A$cnv_met == 'met', final_top_genes_A$coef, NA)
+
+# prendi da expr solo i 100 geni selezionati
+genes2select <- final_top_genes_A$cov
+subset_expr_A <- expr_A[genes2select, ]
+  
+output$heatmap <- renderPlotly({
+    heatmaply(subset_expr_A,
+              scale = 'row',
+              Rowv = FALSE,
+              height = 800,
+              width = 1000,
+              row_names_font_size = 7,
+              na.value = 'grey50',
+              plot_method = "plotly",
+              grid_size = 0.1,
+              dynamicTicks = TRUE,
+              row_side_colors = final_top_genes_A[, c('coef_cnv', 'coef_met'), drop = FALSE]
+              )
+  })
+  
+ 
+data_volcano <- data_table[data_table$cnv_met=='cnv', c('cov', 'coef', 'pval')]
+data_volcano["group"] <- "NotSignificant"
+data_volcano[which(data_volcano['pval'] <= 0.05), 'group'] <- "Significant"
+
+top_peaks <- data_volcano[with(data_volcano, order(coef, pval)),][1:10,]
+top_peaks <- rbind(top_peaks, data_volcano[with(data_volcano, order(-coef, pval)),][1:10,])
+    
+  a <- list()
+for (i in seq_len(nrow(top_peaks))) {
+  m <- top_peaks[i, ]
+  if (m[['pval']] <= 0.05) {
+    a[[i]] <- list(
+      x = m[['coef']],
+      y = -log10(m[['pval']]),
+      text = m[['cov']],
+      xref = 'x',
+      yref = 'y',
+      showarrow = FALSE,
+      ax = 20,  
+      ay = -20,
+      font = list(color = 'black', size = 12, family = 'Arial', fontweight = 'bold')
+    )
+  }
+}
+  
+  output$volcanoPlot <- renderPlotly({
+    plot_ly(data = data_volcano, x = ~coef, y = ~-log10(pval), mode = 'markers', color = ~group, text = ~cov, textposition = 'top right') %>% 
+      layout(title = "Volcano Plot") %>%
+      layout(annotations = a) %>%
+      layout(width = 1000, height = 700)
+  })
+  
+  
+    data_ridge <- data_table
+    filtered_data_ridge <- reactive({
+    df <- data_ridge[data_ridge$class == input$classRidge, ]
+    df$significance <- ifelse(df$pval >= input$pval_range[1] & df$pval <= input$pval_range[2], "Significant", "Not Significant")
+    return(df)
+  })
+  
+    quantiles <- reactive({
+    lower_quantile <- quantile(filtered_data_ridge()$coef, 0.001)
+    upper_quantile <- quantile(filtered_data_ridge()$coef, 0.999)
+    return(c(lower_quantile, upper_quantile))
+  })
+  
+  # Crea il ridgeline plot interattivo
+      output$ridgelinePlot <- renderPlot({
+      ggplot(filtered_data_ridge(), aes(x = coef, y = significance, fill = factor(significance))) +
+      geom_density_ridges(jittered_points = TRUE, quantile_lines = TRUE, vline_size = 1, vline_color = "red",
+    point_size = 0.4, point_alpha = 1,
+    position = position_raincloud(adjust_vlines = TRUE)) +
+      labs(title = "Ridgeline Plot",
+           x = "Value",
+           y = "Significativity") +
+      theme_minimal() +
+      theme_ridges() +  # Aggiungi il tema specifico per ggridges
+      scale_x_continuous(limits = quantiles())
+      #scale_x_continuous(limits = c(min(filtered_data()$coef), max(filtered_data()$coef))) 
+  })
+  
+  # Filtra i dati in base alla soglia di significatività
+  data <- data_table
+  chr_order <- c(1:22, 'X')
+  data$chr_cov <- factor(data$chr_cov, levels = chr_order)
+  
+  filtered_data_histo <- reactive({
+    df_filtered_histo <- data[data$class == input$classHisto, ]
+    df_filtered_histo$significance <- ifelse(df_filtered_histo$pval >= input$pval_range_histo[1] & df_filtered_histo$pval <= input$pval_range_histo[2], "Significant", "Not Significant")
+    return(df_filtered_histo)
+  })
+  
+  # Crea l'istogramma interattivo con Plotly
+  output$histogramPlot <- renderPlotly({
+    ggplotly(
+      ggplot(filtered_data_histo(), aes(x = factor(chr_cov), fill = factor(significance))) +       # per ordinare i chr, devo convertire chr_cov in un fattore con livelli ordinati
+        geom_bar() +
+        labs(title = "Number of Genes with Significant Coefficient by Chromosome",
+             x = "Chromosome",
+             y = "Count") +
+        theme_minimal()
+    )
+  })
+  
+  observeEvent(input$fit, ignoreInit=TRUE, {
+       fit(session, 80)
+    })
+
+    observeEvent(input$setNodeAttributes, ignoreInit=TRUE, {
+       attribute <- "lfc"
+       expression.vector <- switch(input$setNodeAttributes,
+                                   "gal1RGexp" = tbl.mrna$gal1RGexp,
+                                   "gal4RGexp" = tbl.mrna$gal4RGexp,
+                                   "gal80Rexp" = tbl.mrna$gal80Rexp)
+       setNodeAttributes(session, attributeName=attribute, nodes=yeastGalactodeNodeIDs, values=expression.vector)
+    })
+
+    observeEvent(input$loadStyleFile, ignoreInit=TRUE, {
+        if(input$loadStyleFile != "") {
+            styleFile = get(input$loadStyleFile)
+            loadStyleFile(styleFile)  
+        }
+    })
+
+    observeEvent(input$doLayout, ignoreInit=TRUE,{
+        strategy <- input$doLayout
+        doLayout(session, strategy)
+        #session$sendCustomMessage(type="doLayout", message=list(input$doLayout))
+    })
+
+    observeEvent(input$selectName, ignoreInit=TRUE,{
+        session$sendCustomMessage(type="selectNodes", message=list(input$selectName))
+    })
+
+    observeEvent(input$sfn, ignoreInit=TRUE,{
+        session$sendCustomMessage(type="sfn", message=list())
+    })
+
+    observeEvent(input$fitSelected, ignoreInit=TRUE,{
+        fitSelected(session, 100)
+    })
+
+    observeEvent(input$getSelectedNodes, ignoreInit=TRUE, {
+        output$selectedNodesDisplay <- renderText({" "})
+        getSelectedNodes(session)
+    })
+
+    observeEvent(input$clearSelection, ignoreInit=TRUE, {
+        session$sendCustomMessage(type="clearSelection", message=list())
+    })
+
+    observeEvent(input$loopConditions, ignoreInit=TRUE, {
+        condition.names <- c("gal1RGexp", "gal4RGexp", "gal80Rexp")
+        for(condition.name in condition.names){
+           expression.vector <- tbl.mrna[, condition.name]
+           setNodeAttributes(session, attributeName="lfc", nodes=yeastGalactodeNodeIDs, values=expression.vector)
+           Sys.sleep(1)
+           } # for condition.name
+        updateSelectInput(session, "setNodeAttributes", selected="gal1RGexp")
+    })
+
+    observeEvent(input$selectedNodes, {
+        newNodes <- input$selectedNodes;
+        output$selectedNodesDisplay <- renderText({
+           paste(newNodes)
+        })
+    })
+
+    # Output variables 
+    output$network <- renderPrint({ input$action })
+    
+    output$cyjShiny <- renderCyjShiny({
+       cyjShiny(graph, layoutName="cose", styleFile=yeastGalactoseStyleFile)
+    })
+  
+  output$eulerDiagram <- renderPlot({
+    
+    # Check if the input values are valid
+    
+      
+   cnv_genes <- data_table[data_table$cnv_met == 'cnv', 'response']
+   met_genes <- data_table[data_table$cnv_met == 'met', 'response']
+
+# Verifica e rimozione dei valori mancanti
+common_genes <- intersect(cnv_genes[!is.na(cnv_genes)], met_genes[!is.na(met_genes)])
+
+draw.pairwise.venn(
+  area1 = sum(!is.na(cnv_genes)),
+  area2 = sum(!is.na(met_genes)),
+  cross.area = length(common_genes),
+  category = c("CNV Genes", "MET Genes"),
+  fill = c("#F29B05", "#A1D490"),
+  ext.text = TRUE,
+  ext.percent = c(0.1, 0.1, 0.1),
+  ext.length = 0.6,
+  label.col = rep("gray10", 3),
+  lwd = 0,
+  cex = 2,
+  fontface = rep("bold", 3),
+  fontfamily = rep("sans", 3),
+  cat.cex = 1.5,
+  cat.fontface = rep("plain", 2),
+  cat.fontfamily = rep("sans", 2),
+  cat.pos = c(0, 0),
+  print.mode = c("percent", "raw")
+)
+    
+  })
+
+ #### ------------------- TABLE (reactive expressions) ------------------------------------------------------    
+    filtered_data <- reactive({
+      
+    selectedClass <- input$classSelectTable
+    selectedIntegration <- input$integrationSelectTable
+    selectedPval <- input$pvalSelection
+    selectedChr <- input$chrSelection
+    filtered_df <- data_table[data_table$class == selectedClass, ]
+    filtered_df <- filtered_df[filtered_df$omics == selectedIntegration, ]
+   
+    filtered_df <- filtered_df[filtered_df$chr_cov == selectedChr, ]
+    filtered_df[filtered_df$pval >= input$pval_range[1] & filtered_df$pval <= input$pval_range[2], ]
+    
+  })
+  
+  # Render the table based on the filtered data
+    output$res_table <- DT::renderDataTable({
+    DT::datatable(filtered_data(), options = list(orderClasses = TRUE))
+  })
+ #### ------------------- END TABLE -------------------------------------------------
+
+ ### ---------------------- CIRCOS (reactive expressions) ---------------------------
+    circos_reactive <- reactive({
+    
+    #data_gr <- data_gr[data_gr@elementMetadata$cnv_met == selectedIntegrationCircos, ]
+    df_cnv <- df_cnv[df_cnv$class == input$Class, ]
+    cnv_gr <- makeGRangesFromDataFrame(df_cnv, seqnames.field = 'chr', start.field = 'start', end.field = 'end', keep.extra.columns = TRUE, na.rm = TRUE)
+     
+  ##### no method s4 class grange - il problema secondo me sta qui ---- 
+    
+  ### -------------------------- compose_view and arrange_views circos ----------------------------------
+    
+  composed_view_circos <- compose_view(
+  multi = TRUE,
+  layout = 'circular', #linear
+  tracks = add_multi_tracks(track_cyto, track_expr, track_cnv, track_coefs),
+  alignment = 'stack',
+  spacing = 0.01,
+  linkingId = "detail"
+)
+
+  arranged_view_circos <- arrange_views(
+  title = 'Interactive Circos',
+  subtitle = 'subtitle',
+  views = composed_view_circos,
+  xDomain = list(
+  chromosome = 'chr1'
+  )
+)
+
+  })
+    
+    output$gosling_plot_circos <- renderUI({
+      req(circos_reactive())
+      
+      goslingOutput('gosling_plot_circos')
+    })
+  
+  output$gosling_plot_circos <- renderGosling({
+
+    gosling(component_id = "gosling_plot_circos", circos_reactive())
+
+  })
+  
+  observeEvent(input$download_pdf, {
+    export_pdf(component_id = "gosling_plot_circos")
+  })
+  
+  ### -------------------------- end circos panel ----------------------------------
+  
+  ### -------------------------- linear circos -------------------------------------
+  
+  output$gosling_plot_linear <- renderGosling({
+    gosling(
+      component_id = 'gosling_plot_linear',
+      arranged_view_linear
+    )
+  })
+  
+  ### ------------------------------------- histo -------------------------------------------
+  
+  output$gosling_plot_histo <- renderGosling({
+    gosling(
+      component_id = 'gosling_plot_histo',
+      arranged_view_histo
+    )
+  })
+  
+ }
+
+chromosome_options <- c(
+  "Chr 1"= "chr1",
+  "Chr 2"= "chr2",
+  "Chr 3"= "chr3",
+  "Chr 4"= "chr4",
+  "Chr 5"= "chr5",
+  "Chr 6"= "chr6",
+  "Chr 7"= "chr7",
+  "Chr 8"= "chr8",
+  "Chr 9"= "chr9",
+  "Chr 10"= "chr10",
+  "Chr 11"= "chr11",
+  "Chr 12"= "chr12",
+  "Chr 13"= "chr13",
+  "Chr 14"= "chr14",
+  "Chr 15"= "chr15",
+  "Chr 16"= "chr16",
+  "Chr 17"= "chr17",
+  "Chr 18"= "chr18",
+  "Chr 19"= "chr19",
+  "Chr 21"= "chr21",
+  "Chr 22"= "chr22",
+  "Chr X"="chrX",
+  "Chr Y"= "chrY"
+)
+
+### --------------------------------- CIRCOS -------------------------------
+
+#### -------------------------- Covariate track ---------------------------
+track_cnv <- add_single_track(
+  data = track_data_gr(
+    cnv_gr, chromosomeField = 'seqnames',
+    genomicFields = c('start','end'), value = 'cov_value'
+  ),
+  mark = 'bar',
+  x=visual_channel_x(
+    field = 'start', type = 'genomic', axis = 'none'
+  ),
+  xe = visual_channel_x(
+    field = 'end', type = 'genomic', axis = 'none'
+    ),
+  y = visual_channel_y(
+    field = 'cov_value', type = 'quantitative', axis = 'none'
+    ),
+  color = visual_channel_color(field = 'direction_cov', type = 'nominal', domain = c('positive', 'negative'), range = c('blue', 'red')),
+  tooltip = visual_channel_tooltips(
+    visual_channel_tooltip(field = "start", type = "genomic",
+                           alt = "Start position:"),
+    visual_channel_tooltip(field = "end", type = "genomic",
+                           alt = "End Position:"),
+    visual_channel_tooltip(
+      field = "cov_value",
+      title = "cnv",
+      type = "quantitative",
+      alt = " CNV Value:",
+      format = "0.2"
+      ),
+    visual_channel_tooltip(
+      field = 'gene',
+      type = 'nominal',
+      alt = 'Gene Name:'
+    ),
+    visual_channel_tooltip(
+      field = 'class',
+      type = 'nominal',
+      alt = 'Class:'
+    ),
+    visual_channel_tooltip(
+      field = 'cnv_met',
+      type = 'nominal',
+      alt = 'Integration Type:'
+    )
+),
+size = list(value = 2)
+)
+
+### -------------------------- EXPRESSION track ----------------------------
+
+track_expr <- add_single_track(
+  data = track_data_gr(cnv_gr, chromosomeField = 'seqnames',
+                       genomicFields = c('start', 'end')
+  ),
+  mark = 'bar',
+  x = visual_channel_x(
+    field = 'start', type = 'genomic', axis = 'none'
+  ),
+  xe = visual_channel_x(
+    field = 'end', type = 'genomic'
+  ),
+  y = visual_channel_y(
+    field = 'response_value', type = 'quantitative', axis = 'none'
+  ),
+  color = visual_channel_color(field = 'response_value', type = 'quantitative', legend = TRUE),
+  tooltip = visual_channel_tooltips(
+    visual_channel_tooltip(field = "start", type = "genomic",
+                           alt = 'Start Position:'),
+    visual_channel_tooltip(field = "end", type = "genomic",
+                           alt = "End Position:"),
+    visual_channel_tooltip(
+      field = "response_value",
+      type = "quantitative",
+      alt = "Expression Value:",
+      format = "0.2"),
+    visual_channel_tooltip(
+      field = 'gene',
+      type = 'nominal',
+      alt = 'Gene Name:'
+    ),
+    visual_channel_tooltip(
+      field = 'class',
+      type = 'nominal',
+      alt = 'Class:'
+    ),
+    visual_channel_tooltip(
+      field = 'cnv_met',
+      type = 'nominal',
+      alt = 'Integration Type:'
+    )
+  ), 
+  size = list(value = 3)
+)
+
+### ---------------------------------- cytobands track -------------------------------------
+
+track_cyto <- add_single_track(
+  id = "track2",
+  data = track_data(
+    url = "https://raw.githubusercontent.com/sehilyi/gemini-datasets/master/data/UCSC.HG38.Human.CytoBandIdeogram.csv",
+    type = "csv",
+    chromosomeField = "Chromosome",
+    genomicFields = c("chromStart", "chromEnd")
+  ),
+  mark = "rect",
+  x = visual_channel_x(field = "chromStart", type = "genomic"),
+  xe = visual_channel_x(field = "chromEnd", type = "genomic"),
+  color = visual_channel_color(
+    field = "Stain",
+    type = "nominal",
+    domain = c(
+      "gneg", "gpos25", "gpos50", "gpos75", "gpos100", "gvar", "acen"           # acen: centromeric region (UCSC band files)
+    ), 
+    range = c(
+      "white", "#D9D9D9", "#979797", "#636363", "black", "#F0F0F0", "red"
+    )
+  ),
+  stroke = visual_channel_stroke(
+    value = "lightgray"
+  ),
+  strokeWidth = visual_channel_stroke_width(
+    value = 0.5
+  ),
+)
+
+### ------------------------------------ integration coefficients track -------------------------------------
+
+track_coefs <- add_single_track(
+  data = track_data_gr(cnv_gr, chromosomeField = 'seqnames',
+                       genomicFields = c('start', 'end')
+  ),
+  mark = 'bar',
+  x = visual_channel_x(
+    field = 'start', type = 'genomic', axis = 'bottom'
+  ),
+  xe = visual_channel_x(
+    field = 'end', type = 'genomic', axis = 'bottom'
+  ),
+  y = visual_channel_y(
+    field = 'coef', type = 'quantitative', axis = 'none'
+  ),
+  color = visual_channel_color(field = 'direction_coef', type = 'nominal', domain = c('positive', 'negative'), range = c('blue', 'red')), 
+  tooltip = visual_channel_tooltips(
+    visual_channel_tooltip(field = "start", type = "genomic",
+                           alt = 'Start Position:'),
+    visual_channel_tooltip(field = "end", type = "genomic",
+                           alt = "End Position:"),
+    visual_channel_tooltip(
+      field = "coef",
+      type = "quantitative",
+      alt = "Coefficient Value:",
+      format = "0.2"),
+    visual_channel_tooltip(
+      field = 'gene',
+      type = 'nominal',
+      alt = 'Gene Name:'
+    ),
+    visual_channel_tooltip(
+      field = 'class',
+      type = 'nominal',
+      alt = 'Class:'
+    ),
+    visual_channel_tooltip(
+      field = 'cnv_met',
+      type = 'nominal',
+      alt = 'Integration Type:'
+    ),
+     visual_channel_tooltip(
+      field = 'pval',
+      type = 'quantitative',
+      alt = 'Pval:'
+    )
+  ), 
+  size = list(value = 2)
+)
+
+## ----------------------------------------- HISTO PLOT -------------------------------------------
+
+track_histo <- add_single_track(
+  width = 800,
+  height = 180,
+  data = track_data_gr(
+    cnv_gr, chromosomeField = "seqnames",
+    genomicFields = c("start", "end")
+  ),
+  mark = "bar",
+  x = visual_channel_x(
+    field = "start", type = "genomic", axis = "bottom"
+  ),
+  xe = visual_channel_x(field = "end", type = "genomic"),
+  y = visual_channel_y(
+    field = "width", type = "quantitative", axis = "right"
+  ),
+  size = list(value = 5)
+)
+
+composed_view_histo <- compose_view(
+  layout = "linear",
+  tracks = track_histo
+)
+
+arranged_view_histo <- arrange_views(
+  title = "Basic Marks: bar",
+  subtitle = "Tutorial Examples",
+  views = composed_view_histo
+)
+
+ ### ---------------------------------- arrange views and composed views --------------------------------------
+
+composed_view_linear <- compose_view(
+  multi = TRUE,
+  layout = 'linear',
+  tracks = add_multi_tracks(track_cyto, track_expr, track_cnv, track_coefs),
+  alignment = 'stack'
+)
+
+arranged_view_linear <- arrange_views(
+  title = 'Interactive linear Circos',
+  subtitle = 'subtitle',
+  views = composed_view_linear
+)
+
+shiny::shinyApp(ui, server)
+
+
+### implementare brush nel circos in modo da visualizzare il metodo linear a fianco: https://github.com/Appsilon/shiny.gosling/blob/main/inst/examples/circularLinearWithBrush/server.R
+```
+
+```{r venn}
+
+library(shiny)
+library(ggVennDiagram)
+library(plotly)
+library(DT)
+
+# Creazione dei dati di esempio
+cnv_genes <- subset(data_table, cnv_met=='cnv', select = c('cov'))
+met_genes <- subset(data_table, cnv_met=='met', select = c('cov'))
+
+# Trova i geni comuni
+common_genes <- intersect(cnv_genes, met_genes)
+
+# Crea una lista contenente i due vettori di geni
+x <- list(CNV = cnv_genes, MET = met_genes)
+
+# Crea il diagramma di Venn
+p <- ggVennDiagram(x, show_intersect = TRUE)
+
+# Converti il diagramma in un'interfaccia plotly
+p_plotly <- ggplotly(p)
+
+# Aggiungi annotazioni per i geni comuni
+annotations <- lapply(common_genes, function(gene) {
+  list(x = gene, y = 0.5, text = gene, xref = "x", yref = "y", showarrow = FALSE)
+})
+
+p_plotly <- layout(p_plotly, annotations = annotations)
+
+# Creazione dell'interfaccia utente Shiny
+ui <- fluidPage(
+  plotlyOutput("venn_plot"),
+  dataTableOutput("common_genes_table")
+)
+
+# Creazione del server Shiny
+server <- function(input, output) {
+  # Visualizza il diagramma di Venn
+  output$venn_plot <- renderPlotly({
+    p_plotly
+  })
+  
+  # Visualizza la tabella dei geni comuni
+  output$common_genes_table <- renderDataTable({
+    data.frame(Genes = common_genes)
+  })
+}
+
+# Esegui l'applicazione Shiny
+shinyApp(ui = ui, server = server)
+
+```
+
+
+```{r volcano plot}
+library(shiny)
+library(tidyverse)
+library(ggrepel)
+library(shinycssloaders)
+library(DT)
+library(RCurl)
+library(ggiraph)
+library(htmlwidgets)
+
+
+Okabe_Ito <- c("#E69F00", "#56B4E9", "#009E73", "#F0E442", "#0072B2", "#D55E00", "#CC79A7", "#000000")
+
+
+# Create a reactive object here that we can share between all the sessions.
+vals <- reactiveValues(count=0)
+
+# Define UI
+ui <- fluidPage(
+  #Required for proper formatting of the font of the girafeOutput
+  tags$head(tags$style(type="text/css", "text {font-family: sans-serif}")),
+  
+   # Application title
+   titlePanel("volcano plots"),
+   
+   # Sidebar with a slider input for number of bins 
+   sidebarLayout(
+      sidebarPanel(width=3,
+          conditionalPanel(
+            condition = "input.tabs=='Plot' || input.tabs=='iPlot'",
+
+            h4("Aesthetics"),  # section
+
+            sliderInput("pointSize", "Size of the datapoints", 0, 10, 4),  
+            
+            sliderInput("alphaInput", "Visibility of the data", 0, 1, 0.8),  
+
+            h4("Selection & Annotation of hits"),  # section
+            
+           
+           
+            # selectInput("direction", label="Use thresholds to filter hits:", choices = list("Ignore thresholds"="all", "Changed (and significant)"="significant","Increased (and significant)"="increased", "Decreased (and significant)"="decreased"), selected ="significant"),
+            # 
+            # selectInput("criterion", label="Criterion for ranking hits:", choices = list("Manhattan distance"="manh", "Euclidean distance"="euclid","Fold change"="fc","Significance"="sig"), selected ="manh"),
+            
+
+            numericInput("top_x", "Number of top hits (0 to hide):", value = 10),
+          
+            
+            selectizeInput(inputId = 'user_gene_list',
+                           label = "User selected hits:",
+                           choices = "-",
+                          selected = "-",
+                           multiple = TRUE, # allow for multiple inputs
+                            options = list(create = TRUE)), # if TRUE, allows newly created inputs
+           
+            checkboxInput(inputId = "show_table",
+                          label = "Show table with hits",
+                          value = FALSE),
+            checkboxInput(inputId = "hide_labels",
+                          label = "Hide labels in the plot",
+                          value = FALSE),
+
+            radioButtons("adjustcolors", "Color (Unchanged,Incr.,Decr.,User selected)", choices = 
+                           list(
+                             "Grey, Red, Blue, Black" = 1,
+                             "Grey, Blue, Green, Black" = 3,
+                             "Grey, Cyan, Purple, Black" = 4,
+                             "User defined"=5),
+                         selected =  1),
+            conditionalPanel(condition = "input.adjustcolors == 5",
+                             textInput("user_color_list", "List of names or hexadecimal codes", value = "turquoise2,#FF2222,lawngreen,orange")),
+            checkboxInput(inputId = "dark", label = "Dark Theme", value = FALSE),
+         
+            h4("Transformation & Scaling"),        # section
+
+            checkboxInput(inputId = "rotate_plot",
+                          label = "Rotate plot 90 degrees",
+                          value = FALSE),
+            checkboxInput(inputId = "add_grid",
+                          label = "Add gridlines",
+                          value = FALSE),
+            checkboxInput(inputId = "change_scale",
+                          label = "Change scale",
+                          value = FALSE),
+            conditionalPanel(
+              condition = "input.change_scale == true",
+              
+              
+              textInput("range_x", "Range x-axis (min,max)", value = "")
+              
+            ),
+            
+            conditionalPanel(
+              condition = "input.change_scale == true",
+              textInput("range_y", "Range y-axis (min,max)", value = ""),            
+              checkboxInput(inputId = "scale_log_10", label = "Log10 scale on y-axis", value = FALSE)
+              
+            ),
+            numericInput("plot_height", "Plot height (# pixels): ", value = 600),
+            numericInput("plot_width", "Plot width (# pixels):", value = 800),
+
+
+            h4("Labels"),         # section
+  
+            checkboxInput(inputId = "add_title",
+                          label = "Add title",
+                          value = FALSE),
+            conditionalPanel(
+              condition = "input.add_title == true",
+              textInput("title", "Title:", value = "")
+            ),
+            
+            checkboxInput(inputId = "label_axes",
+                          label = "Change axis labels",
+                          value = FALSE),
+            conditionalPanel(
+              condition = "input.label_axes == true",
+              textInput("lab_x", "X-axis:", value = ""),
+              textInput("lab_y", "Y-axis:", value = "")
+              
+            ),
+            
+            checkboxInput(inputId = "adj_fnt_sz",
+                          label = "Change font size",
+                          value = FALSE),
+            conditionalPanel(
+              condition = "input.adj_fnt_sz == true",
+              numericInput("fnt_sz_title", "Plot title:", value = 24),
+              numericInput("fnt_sz_labs", "Axis titles:", value = 24),
+              numericInput("fnt_sz_ax", "Axis labels:", value = 18),
+              numericInput("fnt_sz_cand", "Labels of hits:", value = 6)
+              
+            ),
+
+              checkboxInput(inputId = "add_legend",
+                            label = "Add legend",
+                            value = FALSE),
+            
+         
+              NULL),
+          
+          
+          conditionalPanel(
+            condition = "input.tabs=='iPlot'", NULL),
+              conditionalPanel(
+                  condition = "input.tabs=='Data'",
+             
+              h4('Select X & Y variables'),      # section
+              
+              selectInput("x_var", label = "X-axis; Effect (FC)", choices = "-"),
+              selectInput("y_var", label = "Y-axis; Significance (p-value)", choices = "-"),
+              selectInput("g_var", label = "Select column with names", choices = "-"),
+              selectInput("c_var", label = "Select column with categories", choices = "-"),
+              checkboxInput(inputId = "cat_color",
+                            label = "Use Color to identify Categories",
+                            value = FALSE),
+              
+              hr(),
+
+              NULL
+              )
+      ),   #Close sidebarPanel
+
+      # Show a plot of the generated distribution
+      mainPanel(
+        tabsetPanel(id="tabs",
+                    tabPanel("Data", h4("Data as provided"),dataTableOutput("uploaded")),
+                    tabPanel("Plot",h3("Volcano Plot"
+                                       ),
+                             downloadButton("downloadPlotPDF", "Download pdf-file"),
+                                                      
+                             downloadButton("downloadPlotPNG", "Download png-file"),
+                             
+                             actionButton("settings_copy", icon = icon("clone"),
+                                          label = "Clone current setting"),
+
+                             
+                             div(
+                               style = "position:relative",
+                               
+                               
+                             plotOutput("coolplot",
+                                         height = 'auto',
+                                        # click = "clicked",
+                                        hover = hoverOpts("plot_hover", delay = 10, delayType = "debounce")),uiOutput("hover_info")
+                             ),
+                            
+                            conditionalPanel(
+                              condition = "input.show_table == true",
+                              br(),h3("Top hits (based on distance from origin)"), withSpinner(dataTableOutput('toptableDT')))
+                            
+                              ),
+                    tabPanel("iPlot", h3("Volcano Plot"),
+                             div(downloadButton("downloadHTML", "Download html file"),
+                             girafeOutput("iplot", height="600", width="800"), style = "float:left"),
+
+                             NULL)
+                    )
+        
+      )   #Close mainPanel
+      
+   ) #Close sidebarLayout
+) #Close fluidPage
+
+
+server <- function(input, output, session) {
+  
+  # Session variable - initialize defaults
+  genelist.selected <- ""
+  x_var.selected <- "FC"
+  y_var.selected <- "pval"
+  g_var.selected <- "cov"
+  c_var.selected <- "-"
+  sheet.selected <- " "
+  
+  isolate(vals$count <- vals$count + 1)
+  ###### DATA INPUT ###################
+  
+df_upload <- reactive({                              
+      # default parameters for the initial computation                                               
+      x_var.selected <<- "FC"
+      y_var.selected <<- "pval"
+      g_var.selected <<- "cov"
+      genelist.selected <<- ""
+     
+      data <- data_table
+  
+  #Replace space and dot of header covs by underscore
+  data <- data %>% select_all(~gsub("\\s+|\\.", "_", .))
+    return(data)
+  })
+  
+  #### DISPLAY DATA ##################
+  
+output$uploaded <- renderDataTable(
+    
+    df_upload(),
+    #rowcovs = FALSE,
+    options = list(pageLength = 20, autoWidth = FALSE,
+                   lengthMenu = c(20, 100, 1000, 10000)),
+    editable = FALSE
+    
+  )
+
+observe({
+  
+  
+    df <- df_upload()
+  
+    var_names  <- names(df)
+
+    # Get the names of columns that are factors.
+    nms_fact <- names(Filter(function(x) is.factor(x) || is.integer(x) || is.logical(x) || is.character(x), df))
+    nms_var <- names(Filter(function(x) is.integer(x) || is.numeric(x) || is.double(x), df))
+    nms_fact <- c("-",nms_fact)
+
+    updateSelectInput(session, "x_var", choices = nms_var, selected = x_var.selected)
+    updateSelectInput(session, "y_var", choices = nms_var, selected = y_var.selected)
+    
+    # updateSelectInput(session, "map_size", choices = mapping_list_all)
+   updateSelectInput(session, "g_var", choices = nms_fact, selected = g_var.selected)
+   updateSelectInput(session, "c_var", choices = nms_fact, selected = c_var.selected)
+   
+   updateSelectizeInput(session, "user_gene_list", selected = genelist.selected)
+   
+  })
+
+  ################ Select top hits #########
+  df_top  <- reactive({
+        df <- df_filtered()
+
+        if (input$direction =="increased") {
+          df <- df %>% filter(Change=="Increased")
+          
+        } else if (input$direction =="decreased") {
+          df <- df %>% filter(Change=="Decreased")
+          
+        } else if (input$direction =="significant") {
+          df <- df %>% filter(Change!="Unchanged")
+          
+        }
+         
+        #Get the order right
+        df <- df %>% select(cov, Category, FC, Change, pval)
+        
+        
+        
+          df <- df %>% mutate(`Euclidean distance` = sqrt((`pval`)^2+(`FC`)^2)) %>% arrange(desc(`Euclidean distance`))
+          df_out <- df %>% top_n(input$top_x,`Euclidean distance`)
+        
+        
+        #Add user selected hits, but remove them when already present
+        df_out <- bind_rows(df_out,df_user()) %>% distinct(cov, .keep_all = TRUE)
+        # }
+        
+        df_out$Change <- factor(df_out$Change, levels=c("Unchanged","Increased","Decreased", "Selected"))
+        
+        observe({print(df_out)})
+        return(df_out)
+  })
+
+  ################ List of user-selected hits #########
+  df_user <- reactive({
+    
+    df <- as.data.frame(df_filtered())
+    
+    #select based on text input
+    usr_selection <- c(input$user_gene_list,input$iplot_selected)
+    df_selected_by_name <- df %>% filter(cov %in% usr_selection)    ######################3
+
+    #Select rows from DT
+    table_selection <- input$uploaded_rows_selected
+    # observe({print(table_selection)})
+    if (length(table_selection)>=1){
+      df_selected_by_tab <- df %>% slice(table_selection)
+      df_selected_by_name <- df_selected_by_name %>% bind_rows(df_selected_by_tab)
+    }
+    
+
+    return(df_selected_by_name)
+
+  })
+  
+  observeEvent(input$iplot_selected,{
+    
+    #If selected items are new, add them
+    if (length(intersect(input$iplot_selected,input$user_gene_list))==0) {
+        genelist.selected <<- c(input$user_gene_list,input$iplot_selected)
+        updateSelectizeInput(session, "user_gene_list", selected = genelist.selected)
+    #if not, invert selection
+    } else {
+      common <- intersect(input$user_gene_list,input$iplot_selected)
+      combined <- union(input$user_gene_list,input$iplot_selected)
+      genelist.selected <<- combined[! combined %in% common]
+      updateSelectizeInput(session, "user_gene_list", selected = genelist.selected)
+      
+    }
+
+  })
+  
+  ################ SELECT COLUMNS AND ANNOTATE CHANGES #########
+df_filtered <- reactive({     
+    
+      df <- df_upload()
+
+    x_choice <- input$x_var
+    y_choice <- input$y_var
+    g_choice <- input$g_var
+    c_choice <- input$c_var
+    
+
+    if (g_choice == "-") {
+      koos <- df %>% select(`FC` = !!x_choice , `pval` = !!y_choice)
+      koos$Name <- " "
+    } else if (g_choice != "-") {
+      koos <- df %>% select(`FC` = !!x_choice , `pval` = !!y_choice, Name = input$g_var)
+      #Remove  names after semicolon for hits with multiple names, seperated by semicolons, e.g.: POLR2J3;POLR2J;POLR2J2
+      koos <- koos %>% mutate(Name = gsub(';.*','',Name))
+    }
+    
+    if (c_choice != "-") {kaas <- df %>% select(Category = !!c_choice)
+    observe({print(head(kaas))})
+    koos <- bind_cols(koos,kaas)
+    # observe({print(head(koos))})
+    } else {koos$Category <- 'NA'}
+    
+    
+    if (g_choice != "-") {
+    #Update the gene list for user selection
+    updateSelectizeInput(session, "user_gene_list", choices = koos$Name, selected = genelist.selected)
+    }
+    
+    fc_cutoff <- as.numeric(strsplit(input$fc_cutoff,",")[[1]])
+    
+    foldchange_min=fc_cutoff[1]
+    foldchange_max=fc_cutoff[2]
+
+    pvalue_tr=input$p_cutoff
+
+    if (input$direction =="decreased") {
+      koos <- koos %>%mutate(
+        Change = case_when(
+          `FC` < foldchange_min & `pval` > pvalue_tr ~ "Decreased",
+          TRUE ~ "Unchanged")
+      )
+    } else if (input$direction =="increased") {
+      koos <- koos %>%mutate(
+        Change = case_when(
+          `FC` > foldchange_max & `pval` > pvalue_tr ~ "Increased",
+          TRUE ~ "Unchanged")
+      )
+    } else if (input$direction =="significant"){
+    koos <- koos %>%mutate(
+           Change = case_when(
+             `FC` > foldchange_max & `pval` > pvalue_tr ~ "Increased",
+             `FC` < foldchange_min & `pval` > pvalue_tr ~ "Decreased",
+             TRUE ~ "Unchanged")
+          )
+    } else if (input$direction =="all"){
+      koos <- koos %>%mutate(Change = "Increased")
+        
+    }
+
+    koos <- koos %>% mutate(
+      Alpha = case_when(
+        `Change` == "Decreased" ~ 1.0,
+        `Change` == "Increased" ~ 1.0,
+        `Change` == "NA" ~ 1.0,        
+        TRUE ~ 0.5)
+    )
+
+    return(koos)
+    
+})
+
+############## Render the data summary as a dataTable ###########
+
+output$toptableDT <- renderDataTable(
+    
+    df_top(),
+    extensions = c('Buttons'),
+    rownames = FALSE,
+    options = list(dom = 'Blfrtip', buttons = c('copy', 'csv','excel', 'pdf'), autoWidth = FALSE, lengthMenu = c(20, 100, 1000)),
+    editable = FALSE,selection = 'none'
+  )
+  
+plot_data <- reactive({
+  
+  if (input$dark) {line_color="white"} else {line_color="gray20"}
+    
+    ############## Adjust X-scaling if necessary ##########
+    
+    #Adjust scale if range for x (min,max) is specified
+    if (input$range_x != "" &&  input$change_scale == TRUE) {
+      rng_x <- as.numeric(strsplit(input$range_x,",")[[1]])
+      observe({ print(rng_x) })
+    } else if (input$range_x == "" ||  input$change_scale == FALSE) {
+      
+      rng_x <- c(NULL,NULL)
+    }
+    
+    ############## Adjust Y-scaling if necessary ##########
+    
+    #Adjust scale if range for y (min,max) is specified
+    if (input$range_y != "" &&  input$change_scale == TRUE) {
+      rng_y <- as.numeric(strsplit(input$range_y,",")[[1]])
+    } else if (input$range_y == "" ||  input$change_scale == FALSE) {
+      
+      rng_y <- c(NULL,NULL)
+    }
+    
+    df <- as.data.frame(df_filtered())
+    #Convert 'Change' to a factor to keep this order, necessary for getting the colors right
+    df$Change <- factor(df$Change, levels=c("Unchanged","Increased","Decreased", "Selected"))
+    
+    ########## Determine color use #############
+    if (input$adjustcolors == 1 && input$dark) {
+      newColors <- c("#505050", "#FF3333", "#0092CC")
+    } else if (input$adjustcolors == 1 && input$dark == FALSE) {
+      newColors <- c("grey", "red", "blue")
+    }
+    
+    if (input$adjustcolors == 3 && input$dark) {
+      newColors <- c( "#505050", "deepskyblue", "green")
+    } else if (input$adjustcolors == 3 && input$dark == FALSE) {
+      newColors <- c("Grey80", "darkblue", "darkgreen")
+    }
+  
+    
+    if (input$adjustcolors == 4 && input$dark) {
+      newColors <- c("#505050", "#03DAC5", "#BB86FC") }
+    else if (input$adjustcolors == 4 && input$dark == FALSE)
+    { newColors <- c("grey", "turquoise4","#9932CC")
+   
+    }
+    
+    if (input$adjustcolors != 5) {newColors[4] <- line_color}
+    
+    if (input$adjustcolors == 5) {
+      newColors <- gsub("\\s","", strsplit(input$user_color_list,",")[[1]])
+      
+      #If unsufficient colors available, repeat
+      if(length(newColors) < 4) {
+        newColors<-rep(newColors,times=(round(4/length(newColors)))+1)
+      }
+      
+      
+    }
+    
+    # Remove the color for category 'increased' when absent
+    if (("Increased" %in% df$Change) == FALSE) {
+      newColors <- newColors[c(1,3,4)]
+      
+    }
+    
+    print(newColors)
+    
+    p <-  ggplot(data = df) +
+      aes(x=`FC`) +
+      aes(y=`pval`) +
+      aes(alpha=I(Alpha)*input$alphaInput) +
+    
+      # geom_point(alpha = input$alphaInput, size = input$pointSize, shape = 16) +
+      geom_point_interactive(size = input$pointSize, shape = 16, aes(data_id = Name, tooltip = str_glue("Name: {Name}\nFC: {round(FC,2)}\npval: {round(pval,2)}"))) +
+ 
+      # This add a color to the user-selected datapoints
+      geom_point_interactive(data=df_user(), aes(x=FC,y=pval), color=newColors[4], shape = 16, size=(input$pointSize), alpha=1)+
+      
+            
+      # This needs to go here (before annotations)
+      theme_light(base_size = 16, base_family = "sans")
+    
+    if (input$cat_color != TRUE) {
+      p <- p + aes(color=Change) + scale_color_manual(values=newColors)
+      
+    } else    {  p <- p + aes(color=Category) + scale_color_manual(values=Okabe_Ito) }
+    
+    
+    if (input$dark) {p <- p+ theme_light_dark_bg(base_size = 16, base_family = "sans")}
+    
+    fc_cutoff <- as.numeric(strsplit(input$fc_cutoff,",")[[1]])
+      
+    #Indicate cut-offs with dashed lines
+    if (input$direction =="increased" || input$direction == 'significant')  p <- p + geom_vline(xintercept = fc_cutoff[2], linetype="dashed", color=line_color)
+    if (input$direction =="decreased" || input$direction == 'significant')  p <- p + geom_vline(xintercept = fc_cutoff[1], linetype="dashed", color=line_color)
+    
+    if (input$direction != 'all') {
+      p <- p + geom_hline(yintercept = input$p_cutoff, linetype="dashed", color=line_color) 
+    }
+    # if log-scale checked specified
+    if (input$scale_log_10)
+      p <- p + scale_y_log10() 
+    
+    #remove gridlines (if selected)
+    if (input$add_grid == FALSE) {  
+      p <- p+ theme(panel.grid.major = element_blank(),
+                    panel.grid.minor = element_blank())
+    }
+    
+    ########## User defined labeling     
+    if (input$hide_labels == FALSE) {
+      p <-  p + geom_point(data=df_top(), aes(x=`FC`,y=`pval`), shape=1,color=line_color, size=(input$pointSize))+
+        geom_text_repel(
+          data = df_top(),
+          aes(label = Name),
+          alpha=1,
+          # family="mono",
+          size = input$fnt_sz_cand,
+          color=line_color,
+          nudge_x = 0.2,
+          nudge_y=0.2,
+          box.padding = unit(0.9, "lines"),
+          point.padding = unit(.3+input$pointSize*0.1, "lines"),show.legend=F
+          )
+      
+    }
+    
+    p <- p + coord_cartesian(xlim=c(rng_x[1],rng_x[2]),ylim=c(rng_y[1],rng_y[2]))
+    #### If selected, rotate plot 90 degrees CW ####
+    if (input$rotate_plot == TRUE) { p <- p + coord_flip(xlim=c(rng_x[1],rng_x[2]),ylim=c(rng_y[1],rng_y[2]))}
+    
+    ########## Do some formatting of the lay-out ##########
+    
+    # if title specified
+    if (input$add_title == TRUE) {
+      #Add line break to generate some space
+      title <- paste(input$title, "\n",sep="")
+      p <- p + labs(title = title)
+    } else if (input$sheet !=" ") {
+      title <- paste(input$sheet, "\n",sep="")
+      # observe({print('yay')})
+      p <- p + labs(title = title)
+    }
+    
+    # # if labels specified
+    if (input$label_axes)
+    {p <- p + labs(x = input$lab_x, y = input$lab_y)}
+    else {
+      p <- p + labs(x=bquote('FC ('*Log[2]*')'), y=bquote('pval ('*-Log[10]*')'))
+    }
+    
+    # # if font size is adjusted
+    if (input$adj_fnt_sz) {
+      p <- p + theme(axis.text = element_text(size=input$fnt_sz_ax))
+      p <- p + theme(axis.title = element_text(size=input$fnt_sz_labs))
+      p <- p + theme(plot.title = element_text(size=input$fnt_sz_title))
+    }
+    
+    #remove legend (if selected)
+    if (input$add_legend == FALSE) {  
+      p <- p + theme(legend.position="none")
+    }
+    
+    p
+    
+  })
+
+
+output$iplot <- renderGirafe({
+  
+  if (input$dark) {
+    tooltip_css <- "background-color:white;color:black;padding:10px;border-radius:10px;font-family:sans-serif;font-weight:bold"
+  } else {
+    tooltip_css <- "background-color:black;color:white;padding:10px;border-radius:10px;font-family:sans-serif;font-weight:bold"
+  }
+  
+  w <- 10
+  h <- w*(input$plot_height/input$plot_width)
+  
+  x <- girafe(code = plot(plot_data()),
+
+              width_svg = w, height_svg = h,
+              options = list(
+                opts_hover(css = "fill:#FF3333;stroke:black;cursor:pointer;", reactive = TRUE),
+                opts_selection(
+                  type = "multiple", css = "fill:#FF3333;stroke:black;"),
+                opts_tooltip(css= tooltip_css,offy = -40, opacity = .9),
+                opts_zoom(min = 1, max = 4)
+              ))
+  x
+})
+
+
+selected_state <- reactive({
+  input$iplot_selected
+})
+output$console <- renderPrint({
+  # input$iplot_hovered
+  input$iplot_selected
+})
+  
+####### SAVE ########
+output$downloadHTML <- downloadHandler(
+
+  filename <- function() {
+    paste("VolcaNo", Sys.time(), ".html", sep = "")
+  },
+  content <- function(file) {
+    if (input$dark) {
+      tooltip_css <- "background-color:white;color:black;padding:10px;border-radius:10px;font-family:sans-serif;font-weight:bold"
+    } else {
+      tooltip_css <- "background-color:black;color:white;padding:10px;border-radius:10px;font-family:sans-serif;font-weight:bold"
+    }
+    w <- 10
+    #retain aspect ratio
+    h <- w*(input$plot_height/input$plot_width)
+    saveWidget(widget = 
+                 girafe(ggobj = plot_data(), width_svg = w, height_svg = h,
+                        options = list(
+                   opts_hover(css = "fill:#FF3333;stroke:black;cursor:pointer;", reactive = TRUE),
+                   opts_selection(
+                     type = "multiple", css = "fill:#FF3333;stroke:black;"),
+                   opts_tooltip(css= tooltip_css,offy = -40, opacity = .75),
+                   opts_zoom(min = 1, max = 4)
+                 ))
+               , file = file)
+  }
+    
+)
+
+    ##### Render the plot ############
+
+  ##### Set width and height of the plot area
+  width <- reactive ({ input$plot_width })
+  height <- reactive ({ input$plot_height }) 
+  
+
+  output$coolplot <- renderPlot(width = width, height = height, {
+    plot(plot_data())
+  })
+  
+
+  ######### DEFINE DOWNLOAD BUTTONS FOR ORDINARY PLOT ###########
+  
+  output$downloadPlotPDF <- downloadHandler(
+    filename <- function() {
+      paste("VolcaNo", Sys.time(), ".pdf", sep = "")
+    },
+    content <- function(file) {
+      pdf(file, width = input$plot_width/72, height = input$plot_height/72)
+      plot(plot_data())
+      
+      dev.off()
+    },
+    contentType = "application/pdf" # MIME type of the image
+  )
+  
+  
+  output$downloadPlotPNG <- downloadHandler(
+    filename <- function() {
+      paste("VolcaNo", Sys.time(), ".png", sep = "")
+    },
+    content <- function(file) {
+      png(file, width = input$plot_width*4, height = input$plot_height*4, res=300)
+      plot(plot_data())
+
+      dev.off()
+    },
+    contentType = "application/png" # MIME type of the image
+  )  
+  
+########### Update count #########
+# Reactively update the client.
+output$count <- renderText({
+  vals$count
+})
+
+# When a session ends, decrement the counter.
+session$onSessionEnded(function(){
+  isolate(vals$count <- vals$count - 1)
+})
+
+######## The End; close server ########################
+} #Close server
+
+# Run the application 
+shinyApp(ui = ui, server = server)
+```
+
+
+
+```{r heatmap con sidebar}
+library(shiny)
+library(heatmaply)
+library(dplyr)
+library(plotly)
+
+# ottengo i valori di espressione (no integration)
+expr_A <- multiomics_integration$gene_genomic_res$A$data$response_var
+# traslo la matrice per avere i geni come righe
+expr_A <- t(expr_A)
+
+# ottengo solo il df dove ho integrazione cnv e solo met della classe A
+beta_cnv <- subset(data_table, cnv_met=='cnv', select = c('coef', 'pval', 'cov', 'class', 'cnv_met'))
+beta_met <- subset(data_table, cnv_met=='met', select = c('coef', 'pval', 'cov', 'class', 'cnv_met'))
+beta_cnv_A <- subset(beta_cnv, class=='A', select = c('coef', 'pval', 'cov', 'cnv_met'))
+beta_met_A <- subset(beta_met, class=='A', select = c('coef', 'pval', 'cov', 'cnv_met'))
+
+# rinomino le colonne per avere gli stessi nomi
+names(beta_cnv_A) <- c('coef', 'pval', 'cov', 'cnv_met')
+names(beta_met_A) <- c('coef', 'pval', 'cov', 'cnv_met')
+
+# unisco i df per le righe
+beta_merged_A <- rbind(beta_cnv_A, beta_met_A)
+
+top50_cnv_A <- head(beta_cnv_A[order(beta_cnv_A$pval), ], 25)
+top50_met_A <- head(beta_met_A[order(beta_met_A$pval), ], 25)
+
+# Selezionare i top 50 geni cnv e met unici
+top50_cnv_A <- unique(top50_cnv_A)
+top50_met_A <- unique(top50_met_A)
+
+# Combinare i top 50 geni cnv e met finali
+final_top_genes_A <- rbind(top50_cnv_A, top50_met_A)
+
+# Selezionare i primi 100 geni unici
+final_top_genes_A$coef_cnv <- ifelse(final_top_genes_A$cnv_met == 'cnv', final_top_genes_A$coef, NA)
+final_top_genes_A$coef_met <- ifelse(final_top_genes_A$cnv_met == 'met', final_top_genes_A$coef, NA)
+
+# prendi da expr solo i 100 geni selezionati
+genes2select <- final_top_genes_A$cov
+subset_expr_A <- expr_A[genes2select, ]
+
+# Creazione dell'interfaccia utente Shiny
+ui <- fluidPage(
+  plotlyOutput("heatmap")
+)
+
+# Creazione del server Shiny
+server <- function(input, output) {
+  # Creazione della heatmap con heatmaply
+  output$heatmap <- renderPlotly({
+    heatmaply(subset_expr_A,
+              scale = 'row',
+              Rowv = FALSE,
+              height = 800,
+              width = 1000,
+              row_names_font_size = 7,
+              na.value = 'grey50',
+              plot_method = "plotly",
+              grid_size = 0.1,
+              dynamicTicks = TRUE,
+              row_side_colors = final_top_genes_A[, c('coef_cnv', 'coef_met'), drop = FALSE]
+              )
+  })
+}
+
+# Esecuzione dell'applicazione Shiny
+shinyApp(ui = ui, server = server)
+```
+
+
+```{r network}
+library(shiny)
+library(visNetwork)
+library(htmlwidgets)
+library(graph)
+library(dplyr)
+
+## NETWORK DATA ##
+# metto assieme tf e mirna in una col e tutti i geni regolati in un' altra col
+all <- subset(data_table, omics %in% c('tf_res', 'tf_mirna_res', 'mirna_target_res'), select = c('response', 'cov', 'coef', 'pval'))
+
+# tieni solo i pval significativi
+all <- all[all$pval <= 0.05, ]
+# define nodes (TF, mirna) ---> mettere assieme geni regolati e regolatori
+# Creazione del nuovo dataframe con una singola colonna contenente i valori concatenati
+nodes <- data.frame(gene = c(data_table$cov, data_table$response))
+edges <- subset(all, select = c('cov', 'response'))
+
+# define edges (TF/mirna and linked genes)
+
+visNetwork(nodes, edges, width = '100%')
+
+```
+https://github.com/cytoscape/cyjShiny/tree/master/inst/demos
+
+```{r}
+library(shiny)
+library(visNetwork)
+library(htmlwidgets)
+library(graph)
+library(dplyr)
+
+    all <- subset(data_table, omics %in% c('tf_res', 'tf_mirna_res', 'mirna_target_res'), select = c('response', 'cov', 'coef', 'pval', 'omics'))
+    all <- all[order(all$pval), ]
+    all <- head(all, 300)
+    # ottengo tutti i geni(mirna/tf/targets) in modo da avere un nodo per ogni elemento unico
+    nodes <- data.frame(gene = c(all$cov, all$response))  #controllare doppioni
+    #ottengo gli edges ovvero le coppie di interazioni (from-to)
+    edges <- subset(all, select = c('cov', 'response', 'pval', 'coef'))
+    # #creo una lista che contenga i valori delle due colonne
+    # edges_val <- c(edges$cov, edges$response)
+    # edges_val <- data.frame(nodes = edges_val)
+    
+    
+    
+    # edges_val <- unique(edges_val)
+    # common <- intersect(nodes$gene, edges_val$nodes)
+    # nodes <- nodes[nodes$gene %in% common, ]
+    nodes <- unique(nodes)
+    #nodes <- as.data.frame(nodes)
+    names(nodes) <- 'id'
+    names(edges) <- c('from', 'to', 'pval', 'coef')
+    
+    # ricordare che un tf puó anche essere un target
+    tf_list <- all[all$omics=='tf_res', 'cov']
+    tf_list2 <- all[all$omics=='tf_mirna_res', 'cov']
+    mirna_list <- all[all$omics=='tf_mirna_res', 'response']
+    mirna_list2 <- all[all$omics=='mirna_target_res', 'cov']
+    target_list <- all[all$omics=='tf_res', 'response']
+    target_list2 <- all[all$omics=='tf_mirna_res', 'cov']
+    
+    #unisco le liste
+    tf_list <- unique(c(tf_list, tf_list2))
+    mirna_list <- unique(c(mirna_list, mirna_list2))
+    target_list <- unique(c(target_list, target_list2))
+    
+    
+    # it is possible to add properties by adding variables (cols) ----> see ?visNodes
+    # TF: nodi di colore giallo con forma a rombo giallo
+    # mirna: nodi viola con forma triangolare
+    # target: azzurri con forma a cerchio
+    # geni: quadrati rossi
+    
+    #assegnazione dinamica in base ai dati che ho nel dataframe nodes
+    
+     nodes$label <- nodes$id
+       #ifelse(nodes$id %in% tf_list, 'tf', ifelse(nodes$id %in% mirna_list, 'mirna', ifelse(nodes$id %in% target_list, 'target', 'target')))
+     nodes$shape <- ifelse(nodes$id %in% tf_list, 'diamond', ifelse(nodes$id %in% mirna_list, 'triangle', ifelse(nodes$id %in% target_list, 'circle', 'circle')))
+     nodes$title <- nodes$id
+     nodes$shadow = TRUE
+     nodes$color <- ifelse(nodes$id %in% tf_list, '#FFBA01', ifelse(nodes$id %in% mirna_list, '#9969C7', ifelse(nodes$id %in% target_list, '#CCE7C9','#FFBA01')))
+     nodes$width <- 10
+    
+# define edges (TF/mirna and linked genes)
+     scaling_factor <- 10
+     edges$width <- ifelse(abs(edges$coef) > 0, abs(edges$coef) * scaling_factor, 4) #in base al pval o effect size
+     edges$color <- ifelse(edges$coef > 0, '#4169E1', ifelse(edges$coef < 0, '#ED5564', 'black'))
+     edges$length <- 500
+     edges$title <- paste('pval:', edges$pval, 'coef:', edges$coef)
+     #edges$title <- paste('coef:', edges$coef)
+     
+     legend_nodes <- data.frame(label = c('TF', 'Target', 'miRNA'),
+                                shape = c('diamond', 'circle', 'triangle'),
+                                color = c('#FFBA01', '#CCE7C9', '#9969C7'))
+     
+     legend_edges <- data.frame(color = c('#4169E1', '#ED5564', 'black'),
+                                label = c('UPregulate', 'DOWNregulate', 'no-effect'),
+                                arrows = c('to', 'to', 'to'))
+     
+     
+network <- visNetwork(nodes, edges, width = "100%") %>% 
+  visGroups(groupname = 'TF', color = '#FFBA01') %>%
+  visGroups(groupname = 'Target', color = '#CCE7C9') %>%
+  visGroups(groupname = 'miRNA', color = '#9969C7') %>%
+  visLegend(addEdges = legend_edges, addNodes = legend_nodes, useGroups = F, width = 0.2, position = 'right', main = 'Legend') %>%
+  #visNodes(shape=,
+    #         color=list(
+    #           background=,
+    #           border=,
+    #           highlight=
+    #         ),
+    # shadow=list()) %>%
+  visEdges(shadow = TRUE,
+           arrows =list(to = list(enabled = TRUE)),
+           
+           color = list(color = "black", highlight = "red")) %>%
+  visOptions(highlightNearest = list(enabled = T, degree = 2, hover = T), nodesIdSelection = TRUE, manipulation = T) %>%
+  visLayout(randomSeed = 20)
+    
+    custom_network <- visNetworkEditor(object = network)
+    custom_network
+```
+
